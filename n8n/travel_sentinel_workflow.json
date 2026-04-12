@@ -1,0 +1,241 @@
+{
+  "name": "Travel Sentinel - AI Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Every 6 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [220, 300]
+    },
+    {
+      "parameters": {
+        "agent": "conversationalAgent",
+        "promptType": "define",
+        "text": "You are Travel Sentinel - an AI agent monitoring travel deals for 2 adults with Belarusian passports.\n\nYour workflow:\n1. Call the 'search-deals' tool to find cheap tours/flights (max $400/person)\n2. For each interesting deal, call 'check-visa' to verify visa requirements\n3. Only recommend deals that are FEASIBLE (visa-free, e-visa, or visa-on-arrival)\n4. Flag any transit visa issues (especially Schengen transit!)\n5. Check 'price-drops' for deals that got cheaper since last run\n\nRules:\n- NEVER recommend a deal without checking visa first\n- If visa status is UNKNOWN, add a warning but still show the deal\n- Always mention departure city, dates, price per person, and hotel if available\n- Flag Schengen transit as BLOCKER\n\nFormat your response as a structured report in Russian.",
+        "hasOutputParser": false
+      },
+      "id": "ai-agent",
+      "name": "Claude AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "model": "claude-sonnet-4-20250514",
+        "options": {
+          "maxTokensToSample": 4096,
+          "temperature": 0.3
+        }
+      },
+      "id": "claude-model",
+      "name": "Claude 3.5 Sonnet",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [380, 500],
+      "credentials": {
+        "anthropicApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Anthropic API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "name": "search-deals",
+        "description": "Search for cheap travel deals (tours, flights, cruises) for 2 adults from Belarus/Russia airports. Returns deals under $400/person.",
+        "method": "POST",
+        "url": "http://localhost:8100/tools/search-deals",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ country_code: $fromAI('country_code', 'optional 2-letter country code filter', 'string'), max_price: $fromAI('max_price', 'max price per person in USD, default 400', 'number') }) }}"
+      },
+      "id": "tool-search-deals",
+      "name": "Search Deals Tool",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [580, 500]
+    },
+    {
+      "parameters": {
+        "name": "check-visa",
+        "description": "Check visa requirements for a destination country for Belarusian passport holders. MUST be called before recommending any deal. Returns visa status and transit warnings.",
+        "method": "POST",
+        "url": "http://localhost:8100/tools/check-visa",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ country_code: $fromAI('country_code', 'destination country ISO code like TR, EG, TH', 'string'), country_name: $fromAI('country_name', 'destination country name like Turkey, Egypt', 'string'), transit_countries: $fromAI('transit_countries', 'array of transit country codes if any', 'array') || [] }) }}"
+      },
+      "id": "tool-check-visa",
+      "name": "Visa Check Tool",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [780, 500]
+    },
+    {
+      "parameters": {
+        "name": "price-drops",
+        "description": "Find deals where price dropped significantly since last check. Use to highlight hot deals.",
+        "method": "GET",
+        "url": "http://localhost:8100/tools/price-drops",
+        "sendQuery": true,
+        "parametersQuery": {
+          "values": [
+            {
+              "name": "threshold",
+              "value": "={{ $fromAI('threshold', 'minimum price drop percentage, default 10', 'number') || 10 }}"
+            }
+          ]
+        }
+      },
+      "id": "tool-price-drops",
+      "name": "Price Drops Tool",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [980, 500]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.output }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "telegram-send",
+      "name": "Send to Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [740, 300],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "no-deals-check",
+      "name": "Has Deals?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [620, 300],
+      "conditions": {
+        "options": {
+          "leftValue": "={{ $json.output.length }}",
+          "typeValidation": "loose"
+        },
+        "combinator": "and",
+        "conditions": [
+          {
+            "id": "check-output",
+            "leftValue": "={{ $json.output }}",
+            "rightValue": "",
+            "operator": {
+              "type": "string",
+              "operation": "isNotEmpty"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "connections": {
+    "Every 6 Hours": {
+      "main": [
+        [
+          {
+            "node": "Claude AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Has Deals?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Deals?": {
+      "main": [
+        [
+          {
+            "node": "Send to Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude 3.5 Sonnet": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Claude AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Deals Tool": {
+      "ai_tool": [
+        [
+          {
+            "node": "Claude AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Visa Check Tool": {
+      "ai_tool": [
+        [
+          {
+            "node": "Claude AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Price Drops Tool": {
+      "ai_tool": [
+        [
+          {
+            "node": "Claude AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "travel-sentinel-mvp"
+  }
+}
