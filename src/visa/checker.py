@@ -166,12 +166,17 @@ class VisaChecker:
 
         This is the KEY differentiator - we don't rely on static tables.
         """
-        query = f"visa requirements {country_name} for Belarus passport 2026"
+        # Include current year to bias search toward fresh results
+        from datetime import date as _date
+        current_year = _date.today().year
+        query = f"visa requirements {country_name} Belarusian passport {current_year}"
         client = await self._get_client()
 
         response = await client.get(
             "https://api.search.brave.com/res/v1/web/search",
-            params={"q": query, "count": 5},
+            # freshness="pd" = past day, "pw" = past week
+            # Use "pm" (past month) as balance: fresh but not empty
+            params={"q": query, "count": 5, "freshness": "pm"},
             headers={
                 "Accept": "application/json",
                 "Accept-Encoding": "gzip",
@@ -189,13 +194,20 @@ class VisaChecker:
 
         source_url = results[0].get("url", "") if results else ""
 
+        # Check freshness of top result - warn if older than 6 months
+        top_age_warning = self._check_result_freshness(results)
+
+        notes = self._extract_notes(results)
+        if top_age_warning:
+            notes = f"⚠️ {top_age_warning} | {notes or ''}"
+
         return VisaRequirement(
             country_code=country_code.upper(),
             country_name=country_name,
             passport_type=self._passport,
             visa_status=visa_status,
             max_stay_days=KNOWN_VISA_FREE_BY.get(country_code.upper()),
-            notes=self._extract_notes(results),
+            notes=notes,
             source_url=source_url,
             verified_at=now,
             # TTL: 24 hours for critical data. Visas can change quickly.
@@ -286,4 +298,38 @@ class VisaChecker:
             desc = r.get("description", "").strip()
             if desc and len(desc) > 20:
                 return desc[:500]
+        return None
+
+    @staticmethod
+    def _check_result_freshness(results: list[dict]) -> str | None:
+        """Check if search results look stale (old publication dates).
+
+        Brave Search returns 'page_age' as ISO date or string like '2024-03-15'.
+        If top result is older than 6 months, add a warning.
+        """
+        from datetime import date, timedelta
+        if not results:
+            return None
+
+        top = results[0]
+        page_age_str = top.get("page_age", "") or top.get("age", "")
+
+        if not page_age_str:
+            return None
+
+        try:
+            # Brave returns ISO date string
+            if "T" in page_age_str:
+                page_age_str = page_age_str.split("T")[0]
+            pub_date = date.fromisoformat(page_age_str)
+            age_days = (date.today() - pub_date).days
+
+            if age_days > 180:
+                return (
+                    f"Search result from {pub_date} ({age_days} days ago). "
+                    "Visa rules may have changed - verify with official embassy!"
+                )
+        except (ValueError, TypeError):
+            pass
+
         return None

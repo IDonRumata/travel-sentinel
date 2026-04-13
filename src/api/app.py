@@ -20,8 +20,7 @@ from src.db.pool import close_pool, get_pool
 from src.db.visa_repo import VisaRepository
 from src.models.config import Settings
 from src.models.visa import VisaCheckResult
-from src.scrapers.aviasales import AviasalesScraper
-from src.scrapers.travelata import TravelataScraper
+from src.scrapers.orchestrator import ScraperOrchestrator
 from src.visa.checker import VisaChecker
 
 logger = structlog.get_logger()
@@ -35,8 +34,10 @@ async def lifespan(app: FastAPI):
     app.state.pool = pool
     app.state.deals_repo = DealsRepository(pool)
     app.state.visa_repo = VisaRepository(pool)
+    app.state.orchestrator = ScraperOrchestrator(settings, app.state.deals_repo)
     logger.info("app.started")
     yield
+    await app.state.orchestrator.close()
     await close_pool()
     logger.info("app.stopped")
 
@@ -78,59 +79,70 @@ class PriceDropResponse(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "travel-sentinel"}
+    """Health check: DB ping + circuit breaker states.
+
+    n8n should ping this every 5 minutes. If status != 'ok' -> alert.
+    """
+    # DB health check
+    db_ok = False
+    try:
+        async with app.state.pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        db_ok = True
+    except Exception as exc:
+        logger.error("health.db_failed", error=str(exc))
+
+    circuits = app.state.orchestrator.get_circuit_status()
+    open_circuits = [c for c in circuits if c["state"] == "open"]
+
+    status = "ok"
+    if not db_ok:
+        status = "degraded"
+    elif open_circuits:
+        status = "partial"
+
+    return {
+        "status": status,
+        "service": "travel-sentinel",
+        "db": "ok" if db_ok else "down",
+        "scrapers": circuits,
+        "open_circuits": [c["scraper"] for c in open_circuits],
+    }
 
 
 @app.post("/tools/search-deals", response_model=SearchDealsResponse)
 async def search_deals(req: SearchDealsRequest):
-    """Run all scrapers and return filtered deals.
+    """Run all scrapers via Orchestrator with circuit breaker protection.
 
-    This is the main "search" tool that n8n AI Agent calls.
+    Operational modes returned:
+    - "full": all scrapers healthy
+    - "partial": some scrapers failed, data may be incomplete
+    - "cache_only": all scrapers down, data from DB cache
     """
-    max_pp = req.max_price or settings.max_price_per_person_usd
-    repo = app.state.deals_repo
+    orchestrator: ScraperOrchestrator = app.state.orchestrator
+    summary = await orchestrator.run_all()
 
-    # Run scrapers
-    all_deals = []
-    scrapers = [
-        AviasalesScraper(
-            api_token=settings.aviasales_token,
-            max_price_per_person=int(max_pp),
-            adults=settings.adults,
-        ),
-        TravelataScraper(
-            max_price_per_person=int(max_pp),
-            adults=settings.adults,
-        ),
-    ]
+    mode = summary["mode"]
+    deals_raw = []
 
-    for scraper in scrapers:
-        try:
-            deals = await scraper.run()
-            all_deals.extend(deals)
-        except Exception as exc:
-            logger.error("api.scraper_error", scraper=scraper.name, error=str(exc))
-        finally:
-            await scraper.close()
-
-    # Persist to DB
-    new_count = 0
-    for deal in all_deals:
-        try:
-            _, is_new = await repo.upsert_deal(deal)
-            if is_new:
-                new_count += 1
-        except Exception as exc:
-            logger.error("api.upsert_error", error=str(exc))
-
-    # Filter by country if specified
-    if req.country_code:
-        all_deals = [d for d in all_deals if d.country_code.upper() == req.country_code.upper()]
+    if mode == "cache_only":
+        # All scrapers dead - serve from DB
+        cached = await orchestrator.get_fallback_deals(limit=30)
+        deals_raw = [d.model_dump(mode="json") for d in cached]
+        logger.warning("api.cache_only_mode")
+    else:
+        # Get fresh results from DB (already persisted by orchestrator)
+        cached = await app.state.deals_repo.get_cheapest(
+            country_code=req.country_code,
+            max_price=req.max_price or settings.max_price_per_person_usd,
+            limit=30,
+        )
+        deals_raw = [d.model_dump(mode="json") for d in cached]
 
     return SearchDealsResponse(
-        deals_found=len(all_deals),
-        new_deals=new_count,
-        deals=[d.model_dump(mode="json") for d in all_deals[:30]],
+        deals_found=len(deals_raw),
+        new_deals=summary["deals_new"],
+        deals=deals_raw,
     )
 
 
