@@ -22,6 +22,8 @@ from src.models.config import Settings
 from src.models.visa import VisaCheckResult
 from src.scrapers.orchestrator import ScraperOrchestrator
 from src.visa.checker import VisaChecker
+from src.visa.golden_tests import run_golden_tests
+from src.visa.validator import VisaResultValidator
 
 logger = structlog.get_logger()
 settings = Settings()
@@ -61,6 +63,8 @@ class SearchDealsRequest(BaseModel):
 class SearchDealsResponse(BaseModel):
     deals_found: int
     new_deals: int
+    mode: str = "full"  # full | partial | cache_only
+    data_freshness: str | None = None  # ISO timestamp of latest scrape
     deals: list[dict]
 
 
@@ -139,9 +143,17 @@ async def search_deals(req: SearchDealsRequest):
         )
         deals_raw = [d.model_dump(mode="json") for d in cached]
 
+    # Compute data freshness from latest deal's scraped_at
+    freshness = None
+    if cached:
+        latest = max(d.scraped_at for d in cached)
+        freshness = latest.isoformat()
+
     return SearchDealsResponse(
         deals_found=len(deals_raw),
         new_deals=summary["deals_new"],
+        mode=mode,
+        data_freshness=freshness,
         deals=deals_raw,
     )
 
@@ -168,6 +180,12 @@ async def check_visa(req: VisaCheckRequest):
             country_name=req.country_name,
             transit_countries=req.transit_countries,
         )
+
+        # Level 1: Deterministic validation (free)
+        validator = VisaResultValidator()
+        issues = validator.validate(result)
+        if issues:
+            result.warnings.extend([f"VALIDATION: {issue}" for issue in issues])
 
         # Add warning if data is stale
         if result.is_data_stale:
@@ -214,3 +232,93 @@ async def cheapest_deals(
         limit=limit,
     )
     return {"deals": [d.model_dump(mode="json") for d in deals]}
+
+
+# === Observability endpoints ===
+
+
+@app.post("/ops/golden-tests")
+async def run_golden_test_suite():
+    """Run golden test suite against VisaChecker.
+
+    Level 2 of Quality Pyramid: known correct answers for 17 countries.
+    Run weekly via n8n cron. If accuracy < 85%, send Telegram alert.
+    """
+    checker = VisaChecker(
+        visa_repo=app.state.visa_repo,
+        brave_api_key=settings.brave_search_api_key,
+        passport_type=settings.passport_type,
+    )
+    try:
+        result = await run_golden_tests(
+            check_fn=checker._check_country,
+            threshold=0.85,
+        )
+        return {
+            "total": result.total,
+            "passed": result.passed,
+            "failed": result.failed,
+            "accuracy": result.accuracy,
+            "threshold": 0.85,
+            "status": "PASS" if result.accuracy >= 0.85 else "FAIL",
+            "failures": result.failures,
+            "timestamp": result.timestamp,
+        }
+    finally:
+        await checker.close()
+
+
+@app.get("/ops/stats")
+async def operational_stats():
+    """Operational statistics for the dashboard.
+
+    Shows: scraper health, cache freshness, rejection rates.
+    """
+    repo = app.state.deals_repo
+    circuits = app.state.orchestrator.get_circuit_status()
+
+    # Get latest scrape info
+    async with app.state.pool.acquire() as conn:
+        # Total deals in DB
+        total_deals = await conn.fetchval("SELECT COUNT(*) FROM deals")
+
+        # Deals scraped today
+        today_deals = await conn.fetchval(
+            "SELECT COUNT(*) FROM deals WHERE scraped_at > CURRENT_DATE"
+        )
+
+        # Latest scrape timestamp
+        latest_scrape = await conn.fetchval(
+            "SELECT MAX(scraped_at) FROM deals"
+        )
+
+        # Scraper runs today
+        scrape_runs = await conn.fetch(
+            """
+            SELECT scraper_name, status, COUNT(*) as runs,
+                   SUM(deals_found) as total_found, SUM(deals_new) as total_new
+            FROM scrape_log
+            WHERE started_at > CURRENT_DATE
+            GROUP BY scraper_name, status
+            """
+        )
+
+        # Visa checks today
+        visa_cache_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM visa_requirements WHERE expires_at > NOW()"
+        )
+
+    return {
+        "deals": {
+            "total_in_db": total_deals,
+            "scraped_today": today_deals,
+            "latest_scrape": latest_scrape.isoformat() if latest_scrape else None,
+        },
+        "scrapers": {
+            "circuits": circuits,
+            "runs_today": [dict(r) for r in scrape_runs],
+        },
+        "visa_cache": {
+            "active_entries": visa_cache_count,
+        },
+    }
