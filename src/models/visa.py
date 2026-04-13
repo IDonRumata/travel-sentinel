@@ -77,11 +77,23 @@ class VisaCheckResult(BaseModel):
         return True
 
     @property
+    def is_data_stale(self) -> bool:
+        """Check if visa data is older than 24 hours - may need refresh."""
+        if not self.destination_visa.verified_at:
+            return True
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        age = now - self.destination_visa.verified_at
+        return age > timedelta(hours=24)
+
+    @property
     def summary(self) -> str:
         parts = [f"Destination ({self.destination_visa.country_code}): {self.destination_visa.visa_status.value}"]
         for t in self.transit_visas:
             status = "VISA REQUIRED" if t.visa_required else "OK"
             parts.append(f"Transit ({t.transit_country}): {status}")
+        if self.is_data_stale:
+            parts.append("⚠️ DATA OLD - verify before booking!")
         if self.warnings:
             parts.append("Warnings: " + "; ".join(self.warnings))
         return " | ".join(parts)

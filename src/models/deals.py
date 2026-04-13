@@ -45,8 +45,12 @@ class DealCreate(BaseModel):
     @computed_field
     @property
     def checksum(self) -> str:
-        """SHA256 from key fields for deduplication."""
-        key = f"{self.source}|{self.destination}|{self.departure_code}|{self.departure_date}|{self.price_eur}|{self.url}"
+        """SHA256 from IMMUTABLE tour fields ONLY (NOT price!).
+
+        Price changes are tracked in price_history table via UPSERT.
+        If price is included here, a $10 drop becomes a "new deal" instead of "price drop".
+        """
+        key = f"{self.source}|{self.destination}|{self.departure_code}|{self.departure_date}|{self.url}"
         return hashlib.sha256(key.encode()).hexdigest()
 
 

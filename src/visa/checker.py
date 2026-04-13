@@ -198,7 +198,8 @@ class VisaChecker:
             notes=self._extract_notes(results),
             source_url=source_url,
             verified_at=now,
-            expires_at=now + timedelta(days=7),
+            # TTL: 24 hours for critical data. Visas can change quickly.
+            expires_at=now + timedelta(hours=24),
         )
 
     def _analyze_search_results(
@@ -206,13 +207,15 @@ class VisaChecker:
     ) -> VisaStatus:
         """Analyze search snippets to determine visa status.
 
-        Uses keyword matching on search result descriptions.
-        For production: this should be delegated to Claude for nuanced parsing.
+        STRICT validation: requires both "Belarus" AND visa status keyword.
+        Avoids hallucinations by failing-closed to UNKNOWN if ambiguous.
         """
         if not results:
             # Fallback to known data if search fails
             if country_code.upper() in KNOWN_VISA_FREE_BY:
+                logger.info("visa.using_known_table", country=country_code)
                 return VisaStatus.VISA_FREE
+            logger.warning("visa.no_search_results", country=country_code)
             return VisaStatus.UNKNOWN
 
         combined_text = " ".join(
@@ -220,9 +223,13 @@ class VisaChecker:
             for r in results
         )
 
+        # REQUIREMENT: Must mention Belarus explicitly
+        belarus_keywords = ["belarus", "belarusian", "белорусский", "беларусь"]
+        mentions_belarus = any(kw in combined_text for kw in belarus_keywords)
+
         visa_free_signals = [
             "visa-free", "visa free", "безвизовый", "без визы",
-            "no visa required", "visa not required",
+            "no visa required", "visa not required", "don't need visa",
         ]
         e_visa_signals = [
             "e-visa", "electronic visa", "электронная виза", "evisa",
@@ -235,15 +242,23 @@ class VisaChecker:
             "visa is required",
         ]
 
-        # Priority: most restrictive first (safe default)
+        # Priority: most restrictive first (safe default is UNKNOWN if unclear)
         if any(signal in combined_text for signal in visa_required_signals):
-            # But check if it also says visa-free (conflicting info = UNKNOWN)
+            # Check for conflicting info (visa-free AND visa-required = UNKNOWN)
             if any(signal in combined_text for signal in visa_free_signals):
+                logger.warning("visa.conflicting_signals", country=country_code)
                 return VisaStatus.UNKNOWN
             return VisaStatus.VISA_REQUIRED
 
         if any(signal in combined_text for signal in visa_free_signals):
-            return VisaStatus.VISA_FREE
+            if mentions_belarus:
+                return VisaStatus.VISA_FREE
+            # If visa-free is mentioned but NOT for Belarus → fallback to known table
+            if country_code.upper() in KNOWN_VISA_FREE_BY:
+                logger.info("visa.guessing_from_known_table", country=country_code)
+                return VisaStatus.VISA_FREE
+            logger.warning("visa.vf_not_for_belarus", country=country_code)
+            return VisaStatus.UNKNOWN
 
         if any(signal in combined_text for signal in e_visa_signals):
             return VisaStatus.E_VISA
@@ -251,10 +266,17 @@ class VisaChecker:
         if any(signal in combined_text for signal in voa_signals):
             return VisaStatus.VISA_ON_ARRIVAL
 
-        # If we have known data, use it as fallback
+        # If we have known data AND no conflicting signals
         if country_code.upper() in KNOWN_VISA_FREE_BY:
+            logger.info("visa.fallback_known_table", country=country_code)
             return VisaStatus.VISA_FREE
 
+        # Default: UNKNOWN is safer than wrong guess
+        logger.warning(
+            "visa.unknown_status",
+            country=country_code,
+            search_text_len=len(combined_text),
+        )
         return VisaStatus.UNKNOWN
 
     @staticmethod

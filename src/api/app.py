@@ -139,6 +139,11 @@ async def check_visa(req: VisaCheckRequest):
     """Check visa requirements for a destination + transit points.
 
     Critical tool - the "Devil's Advocate" that prevents booking mistakes.
+
+    Warnings to watch for:
+    - is_data_stale: True if verified > 24h ago (visa rules can change overnight)
+    - warnings array: flags like Schengen requirements, UNKNOWN status, etc.
+    - is_feasible: False = DO NOT RECOMMEND THIS TRIP
     """
     checker = VisaChecker(
         visa_repo=app.state.visa_repo,
@@ -150,6 +155,20 @@ async def check_visa(req: VisaCheckRequest):
             country_code=req.country_code,
             country_name=req.country_name,
             transit_countries=req.transit_countries,
+        )
+
+        # Add warning if data is stale
+        if result.is_data_stale:
+            result.warnings.append(
+                "⚠️ STALE DATA: Visa info is > 24 hours old. "
+                "Verify with official source before final booking decision."
+            )
+
+        logger.info(
+            "api.visa_checked",
+            country=req.country_code,
+            feasible=result.is_feasible,
+            stale=result.is_data_stale,
         )
         return result
     except Exception as exc:
