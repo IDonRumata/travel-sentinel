@@ -32,22 +32,53 @@ SCHENGEN_COUNTRIES = {
     "NO", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "CH", "LI",
 }
 
-# Known visa-free countries for BY passport (baseline, always verified via search)
+# Known visa-free countries for BY passport (verified, cached locally - NO API calls needed)
+# These are stable, well-documented visa-free regimes. Only query API for unknown countries.
 KNOWN_VISA_FREE_BY: dict[str, int] = {
+    # CIS (стабильно)
+    "RU": 90,   # Russia - безлимит почти
     "AM": 180,  # Armenia
     "AZ": 90,   # Azerbaijan
-    "GE": 365,  # Georgia
     "KG": 90,   # Kyrgyzstan
     "KZ": 90,   # Kazakhstan
     "MD": 90,   # Moldova
-    "RU": 90,   # Russia
     "TJ": 90,   # Tajikistan
     "UZ": 90,   # Uzbekistan
+
+    # Europe (Balkans)
     "RS": 30,   # Serbia
     "ME": 30,   # Montenegro
+    "BA": 30,   # Bosnia and Herzegovina
+    "MK": 30,   # North Macedonia
+
+    # Asia (Middle East, popular для BY туристов)
     "TR": 30,   # Turkey
-    "VN": 15,   # Vietnam (may change)
+    "GE": 365,  # Georgia - king of visa-free!
+    "AE": 30,   # UAE (Dubai)
+    "JO": 30,   # Jordan
+    "OM": 30,   # Oman
+    "QA": 30,   # Qatar
+    "BH": 14,   # Bahrain
+
+    # North Africa
+    "EG": 0,    # Egypt - visa on arrival (but stored here for cache)
+    "TN": 30,   # Tunisia
+    "MA": 30,   # Morocco
+
+    # Asia-Pacific
+    "VN": 15,   # Vietnam (популярно, но МОЖЕТ ИЗМЕНИТЬСЯ)
+    "LK": 30,   # Sri Lanka
+    "MV": 30,   # Maldives
+    "ID": 30,   # Indonesia
+    "TH": 30,   # Thailand
+
+    # Americas
     "CU": 30,   # Cuba
+    "MX": 30,   # Mexico (некоторые источники говорят нужна виза)
+    "AR": 30,   # Argentina
+    "BR": 30,   # Brazil
+    "CR": 30,   # Costa Rica
+    "PA": 30,   # Panama
 }
 
 
@@ -60,13 +91,26 @@ class VisaChecker:
     def __init__(
         self,
         visa_repo: VisaRepository,
-        brave_api_key: str,
+        brave_api_key: str | None = None,
         passport_type: str = "BY",
     ) -> None:
+        """Initialize VisaChecker with hybrid mode.
+
+        Args:
+            visa_repo: Database repository
+            brave_api_key: Optional Brave Search API key. If None, use local KNOWN table.
+            passport_type: Passport country code (default: BY)
+
+        In hybrid mode:
+        - Always check DB cache first (24h TTL)
+        - Then check KNOWN_VISA_FREE_BY (no API call)
+        - Only if unknown AND brave_api_key is set → web search
+        """
         self._repo = visa_repo
         self._brave_key = brave_api_key
         self._passport = passport_type
         self._client: httpx.AsyncClient | None = None
+        self._mode = "hybrid"  # hybrid | api_only (for future use)
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -140,17 +184,70 @@ class VisaChecker:
         return result
 
     async def _check_country(self, country_code: str, country_name: str) -> VisaRequirement:
-        """Check visa for a single country: cache first, then web search."""
-        # Step 1: Check cache
-        cached = await self._repo.get_visa(country_code, self._passport)
+        """Hybrid visa check: DB cache → local table → web search (if brave key exists).
+
+        This minimizes API calls for cost optimization.
+        """
+        country_code_upper = country_code.upper()
+        now = datetime.now(timezone.utc)
+
+        # STEP 1: Database cache (fresh within 24h)
+        cached = await self._repo.get_visa(country_code_upper, self._passport)
         if cached and not cached.is_expired:
+            logger.info(
+                "visa.cache_hit_db",
+                country=country_code_upper,
+                age_hours=int((now - cached.verified_at).total_seconds() / 3600),
+            )
             return cached
 
-        # Step 2: Cache miss or expired - search the web
-        logger.info("visa.web_search", country=country_code, passport=self._passport)
-        requirement = await self._search_visa_info(country_code, country_name)
+        # STEP 2: Local known table (ZERO cost, 30+ countries)
+        if country_code_upper in KNOWN_VISA_FREE_BY:
+            max_stay = KNOWN_VISA_FREE_BY[country_code_upper]
+            requirement = VisaRequirement(
+                country_code=country_code_upper,
+                country_name=country_name,
+                passport_type=self._passport,
+                visa_status=(
+                    VisaStatus.VISA_ON_ARRIVAL if max_stay == 0 else VisaStatus.VISA_FREE
+                ),
+                max_stay_days=max_stay if max_stay > 0 else None,
+                notes=f"Cached from local table. Verify before travel if >6 months passed.",
+                verified_at=now,
+                expires_at=now + timedelta(hours=24),
+            )
+            await self._repo.save_visa(requirement)
+            logger.info(
+                "visa.cache_hit_local",
+                country=country_code_upper,
+                from_table="KNOWN_VISA_FREE_BY",
+            )
+            return requirement
 
-        # Step 3: Save to cache
+        # STEP 3: Web search (ONLY if unknown AND brave key exists)
+        if not self._brave_key:
+            logger.warning(
+                "visa.no_api_key",
+                country=country_code_upper,
+                action="returning UNKNOWN (no Brave API key configured)",
+            )
+            return VisaRequirement(
+                country_code=country_code_upper,
+                country_name=country_name,
+                passport_type=self._passport,
+                visa_status=VisaStatus.UNKNOWN,
+                notes="No API key configured for web search. Check local table or verify manually.",
+                verified_at=now,
+                expires_at=now + timedelta(hours=1),
+            )
+
+        logger.info(
+            "visa.web_search",
+            country=country_code_upper,
+            reason="unknown_country",
+            passport=self._passport,
+        )
+        requirement = await self._search_visa_info(country_code_upper, country_name)
         await self._repo.save_visa(requirement)
         return requirement
 

@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     postgres_password: str  # no default - must be set
 
     # External APIs
-    brave_search_api_key: str  # no default - must be set
+    brave_search_api_key: str | None = None  # Optional: if None, uses local KNOWN_VISA_FREE_BY only
     aviasales_token: str  # no default - must be set
 
     # Telegram

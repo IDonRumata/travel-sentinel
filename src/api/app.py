@@ -171,7 +171,7 @@ async def check_visa(req: VisaCheckRequest):
     """
     checker = VisaChecker(
         visa_repo=app.state.visa_repo,
-        brave_api_key=settings.brave_search_api_key,
+        brave_api_key=settings.brave_search_api_key,  # May be None (hybrid mode)
         passport_type=settings.passport_type,
     )
     try:
@@ -246,7 +246,7 @@ async def run_golden_test_suite():
     """
     checker = VisaChecker(
         visa_repo=app.state.visa_repo,
-        brave_api_key=settings.brave_search_api_key,
+        brave_api_key=settings.brave_search_api_key,  # May be None (hybrid mode)
         passport_type=settings.passport_type,
     )
     try:
