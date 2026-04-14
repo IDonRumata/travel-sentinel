@@ -73,6 +73,14 @@ class VisaCheckRequest(BaseModel):
     country_code: str = Field(description="Destination country code")
     country_name: str = Field(description="Destination country name")
     transit_countries: list[str] = Field(default_factory=list, description="Transit country codes")
+    user_has_active_visas: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Active visas the traveler holds - unlocks TWOV rules. "
+            "Values: 'US', 'GB', 'CA', 'AU', 'JP', 'IE', 'Schengen' (any Schengen visa). "
+            "Example: ['Schengen'] unlocks UK/Schengen airside transit for BY passport."
+        ),
+    )
 
 
 class PriceDropResponse(BaseModel):
@@ -180,6 +188,7 @@ async def check_visa(req: VisaCheckRequest):
             country_code=req.country_code,
             country_name=req.country_name,
             transit_countries=req.transit_countries,
+            user_has_active_visas=req.user_has_active_visas,
         )
 
         # Level 1: Deterministic validation (free)
@@ -188,7 +197,6 @@ async def check_visa(req: VisaCheckRequest):
         if issues:
             result.warnings.extend([f"VALIDATION: {issue}" for issue in issues])
 
-        # Add warning if data is stale
         if result.is_data_stale:
             result.warnings.append(
                 "⚠️ STALE DATA: Visa info is > 24 hours old. "
@@ -200,6 +208,7 @@ async def check_visa(req: VisaCheckRequest):
             country=req.country_code,
             feasible=result.is_feasible,
             stale=result.is_data_stale,
+            twov_context=req.user_has_active_visas,
         )
         return result
     except Exception as exc:
@@ -253,6 +262,7 @@ async def check_visa_with_transit(req: VisaCheckRequest):
             country_code=req.country_code,
             country_name=req.country_name,
             transit_countries=req.transit_countries,
+            user_has_active_visas=req.user_has_active_visas,
         )
 
         validator = VisaResultValidator()

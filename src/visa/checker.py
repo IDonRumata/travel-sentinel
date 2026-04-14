@@ -126,29 +126,92 @@ class VisaChecker:
         country_code: str,
         country_name: str,
         transit_countries: list[str] | None = None,
+        user_has_active_visas: list[str] | None = None,
     ) -> VisaCheckResult:
-        """Full visa check: destination + all transit points."""
+        """Full visa check: destination + all transit points.
+
+        Args:
+            transit_countries: ISO codes of transit countries (from flight route)
+            user_has_active_visas: Active visas the traveler holds (e.g. ["US", "Schengen"]).
+                Used to unlock TWOV (Transit Without Visa) rules.
+                "Schengen" = any valid Schengen visa
+                "US" = valid US visa/green card
+        """
         warnings: list[str] = []
+        active_visas = [v.upper() for v in (user_has_active_visas or [])]
 
         # 1. Check destination visa
         dest_visa = await self._check_country(country_code, country_name)
 
-        # 2. Check transit countries
+        # 2. Check transit countries with TWOV awareness
         transit_results: list[TransitRequirement] = []
         for tc in transit_countries or []:
-            if tc.upper() in SCHENGEN_COUNTRIES:
-                warnings.append(
-                    f"ALERT: Transit through {tc} (Schengen zone) - "
-                    f"Belarusian passport holders need a Schengen visa for transit!"
-                )
-                transit_results.append(
-                    TransitRequirement(
-                        transit_country=tc.upper(),
-                        passport_type=self._passport,
-                        visa_required=True,
-                        notes="Schengen zone - visa required for BY citizens",
+            tc_upper = tc.upper()
+
+            if tc_upper in SCHENGEN_COUNTRIES:
+                # TWOV rule: Schengen transit MAY be allowed if user has active US/UK/CA visa
+                twov_unlocked = self._check_twov_schengen(active_visas)
+                if twov_unlocked:
+                    warnings.append(
+                        f"ℹ️ Schengen transit ({tc_upper}): TWOV may apply "
+                        f"because user holds active {twov_unlocked} visa. "
+                        "Max 24h transit. Verify specific airport rules before booking."
                     )
-                )
+                    transit_results.append(
+                        TransitRequirement(
+                            transit_country=tc_upper,
+                            passport_type=self._passport,
+                            visa_required=False,
+                            max_transit_hrs=24,
+                            notes=f"TWOV (Transit Without Visa) via {twov_unlocked} visa. "
+                                  "Airside only, no terminal change.",
+                        )
+                    )
+                else:
+                    warnings.append(
+                        f"🚫 Schengen transit ({tc_upper}): visa required for BY passport. "
+                        "Tip: if you hold active US/UK visa, TWOV may apply."
+                    )
+                    transit_results.append(
+                        TransitRequirement(
+                            transit_country=tc_upper,
+                            passport_type=self._passport,
+                            visa_required=True,
+                            notes="Schengen zone - visa required. TWOV possible with US/UK visa.",
+                        )
+                    )
+
+            elif tc_upper == "GB":
+                # UK has its own TWOV rules (not Schengen)
+                twov_unlocked = self._check_twov_uk(active_visas)
+                if twov_unlocked:
+                    warnings.append(
+                        f"ℹ️ UK transit (GB): TWOV may apply via {twov_unlocked} visa. "
+                        "Max 24h airside only. No terminal change. Verify with airline."
+                    )
+                    transit_results.append(
+                        TransitRequirement(
+                            transit_country="GB",
+                            passport_type=self._passport,
+                            visa_required=False,
+                            max_transit_hrs=24,
+                            notes=f"TWOV via {twov_unlocked} visa - airside only.",
+                        )
+                    )
+                else:
+                    warnings.append(
+                        "🚫 UK transit (GB): Direct Airside Transit Visa required for BY. "
+                        "TWOV possible with valid US/Schengen/Irish visa."
+                    )
+                    transit_results.append(
+                        TransitRequirement(
+                            transit_country="GB",
+                            passport_type=self._passport,
+                            visa_required=True,
+                            notes="UK DATV required. TWOV possible with US/Schengen/Irish visa.",
+                        )
+                    )
+
             else:
                 transit = await self._repo.get_transit(tc, self._passport)
                 if transit:
@@ -182,6 +245,39 @@ class VisaChecker:
             warnings_count=len(warnings),
         )
         return result
+
+    @staticmethod
+    def _check_twov_schengen(active_visas: list[str]) -> str | None:
+        """Check if TWOV applies for Schengen transit.
+
+        Returns the unlocking visa name if TWOV is possible, None otherwise.
+        TWOV for Schengen: valid US, UK, Canadian, or Japanese visa unlocks airside transit.
+        Source: https://www.schengenvisainfo.com/transit-visa/
+        """
+        twov_unlocking_visas = {"US", "GB", "CA", "JP"}
+        # "Schengen" as generic - user already has one Schengen country visa
+        if "SCHENGEN" in active_visas:
+            return "Schengen"
+        for v in active_visas:
+            if v in twov_unlocking_visas:
+                return v
+        return None
+
+    @staticmethod
+    def _check_twov_uk(active_visas: list[str]) -> str | None:
+        """Check if TWOV applies for UK airside transit (DATV waiver).
+
+        UK DATV waiver applies if traveler holds valid: US, Schengen, Irish,
+        Canadian, Australian, New Zealand, or Japanese visa.
+        Source: UK Home Office immigration rules Appendix V.
+        """
+        twov_unlocking_visas = {"US", "IE", "CA", "AU", "NZ", "JP"}
+        if "SCHENGEN" in active_visas:
+            return "Schengen"
+        for v in active_visas:
+            if v in twov_unlocking_visas:
+                return v
+        return None
 
     async def _check_country(self, country_code: str, country_name: str) -> VisaRequirement:
         """Hybrid visa check: DB cache → local table → web search (if brave key exists).

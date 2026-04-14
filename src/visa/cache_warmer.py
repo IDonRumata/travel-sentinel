@@ -8,10 +8,12 @@ Strategy:
 - Designed to run as a weekly cron in n8n
 
 Cost estimate: 10 countries × $0.02/search = $0.20/week = $0.87/month (acceptable)
+Rate limiting: 2s delay between requests to avoid exhausting free API quota in one burst.
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 import httpx
@@ -79,7 +81,7 @@ class VisaCacheWarmer:
 
         logger.info("cache_warmer.start", countries=len(TOP_WATCHED_COUNTRIES))
 
-        for country_code, country_name in TOP_WATCHED_COUNTRIES:
+        for idx, (country_code, country_name) in enumerate(TOP_WATCHED_COUNTRIES):
             try:
                 result = await self._warm_country(country_code, country_name)
                 results.append(result)
@@ -104,6 +106,13 @@ class VisaCacheWarmer:
                     "status": "error",
                     "error": str(exc),
                 })
+
+            # Rate limiting: 2s delay between API calls
+            # Prevents exhausting free tier quota (100 req/day Google, 2000/month Brave)
+            # in one burst. Last country doesn't need a delay.
+            if idx < len(TOP_WATCHED_COUNTRIES) - 1:
+                logger.debug("cache_warmer.rate_limit_sleep", country=country_code)
+                await asyncio.sleep(2)
 
         # Send Telegram alert if any status changed
         if changes_detected:

@@ -128,9 +128,10 @@ class AviasalesScraper(BaseScraper):
             link = ticket.get("link", "")
             full_url = f"https://www.aviasales.ru{link}" if link else f"https://www.aviasales.ru/search/{origin}{departure_at.replace('-','')}{destination}1"
 
-            # Extract transit countries from route
-            # Aviasales API returns route as list of IATA codes in ticket["route"]
-            route_airports = ticket.get("route", [origin, destination])
+            # Extract transit countries from SEGMENTS (not just route)
+            # segments[] gives each individual flight leg with departure/arrival airport
+            # This catches "ghost transits" - technical stops that don't show in route summary
+            route_airports = self._extract_route_from_segments(ticket, origin, destination)
             transit_countries = get_transit_countries(route_airports)
 
             if transit_countries:
@@ -160,6 +161,62 @@ class AviasalesScraper(BaseScraper):
             )
 
         return results
+
+    @staticmethod
+    def _extract_route_from_segments(ticket: dict, origin: str, destination: str) -> list[str]:
+        """Extract full route as ordered IATA codes from ticket segments.
+
+        Aviasales API response may include:
+        - ticket["route"]: simplified route string (may omit technical stops)
+        - ticket["segments"]: detailed list of each flight leg (most complete)
+
+        We prefer segments to catch "ghost transits" - technical stops that
+        don't appear in the simplified route but legally cross a border.
+
+        Example:
+            segments = [
+                {"origin": "MSQ", "destination": "FRA"},  # Minsk -> Frankfurt
+                {"origin": "FRA", "destination": "GRU"},  # Frankfurt -> Sao Paulo
+            ]
+            → route = ["MSQ", "FRA", "GRU"]
+            → transit = ["DE"]  (Germany - Schengen!)
+        """
+        segments = ticket.get("segments", [])
+
+        if segments:
+            # Build ordered list of all airports from segments
+            airports: list[str] = []
+            for seg in segments:
+                dep = seg.get("origin") or seg.get("departure") or seg.get("from", "")
+                arr = seg.get("destination") or seg.get("arrival") or seg.get("to", "")
+                if dep and dep not in airports:
+                    airports.append(dep.upper())
+                if arr:
+                    airports.append(arr.upper())  # Always add arrivals (may be visited multiple times)
+
+            # Deduplicate while preserving order (for connecting flights)
+            seen: set[str] = set()
+            unique_route: list[str] = []
+            for ap in airports:
+                if ap not in seen:
+                    seen.add(ap)
+                    unique_route.append(ap)
+
+            if unique_route:
+                logger.debug(
+                    "aviasales.route_from_segments",
+                    segments_count=len(segments),
+                    route=unique_route,
+                )
+                return unique_route
+
+        # Fallback: use simplified route field if segments unavailable
+        route = ticket.get("route", [])
+        if isinstance(route, list) and route:
+            return [r.upper() for r in route]
+
+        # Last resort: origin + destination only (no transit info)
+        return [origin.upper(), destination.upper()]
 
     @staticmethod
     def _airport_to_city(code: str) -> str:
