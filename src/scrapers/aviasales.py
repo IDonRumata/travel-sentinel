@@ -8,6 +8,7 @@ import structlog
 
 from src.models.deals import DealCreate, DealType
 from src.scrapers.base import BaseScraper
+from src.scrapers.iata_countries import get_transit_countries
 
 logger = structlog.get_logger()
 
@@ -127,6 +128,18 @@ class AviasalesScraper(BaseScraper):
             link = ticket.get("link", "")
             full_url = f"https://www.aviasales.ru{link}" if link else f"https://www.aviasales.ru/search/{origin}{departure_at.replace('-','')}{destination}1"
 
+            # Extract transit countries from route
+            # Aviasales API returns route as list of IATA codes in ticket["route"]
+            route_airports = ticket.get("route", [origin, destination])
+            transit_countries = get_transit_countries(route_airports)
+
+            if transit_countries:
+                logger.info(
+                    "aviasales.transit_detected",
+                    route=route_airports,
+                    transit_countries=transit_countries,
+                )
+
             results.append(
                 DealCreate(
                     deal_type=DealType.FLIGHT,
@@ -142,6 +155,7 @@ class AviasalesScraper(BaseScraper):
                     price_original=float(price),
                     currency="USD",
                     url=full_url,
+                    transit_countries=transit_countries,
                 )
             )
 

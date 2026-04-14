@@ -21,6 +21,7 @@ from src.db.visa_repo import VisaRepository
 from src.models.config import Settings
 from src.models.visa import VisaCheckResult
 from src.scrapers.orchestrator import ScraperOrchestrator
+from src.visa.cache_warmer import VisaCacheWarmer
 from src.visa.checker import VisaChecker
 from src.visa.golden_tests import run_golden_tests
 from src.visa.validator import VisaResultValidator
@@ -234,6 +235,64 @@ async def cheapest_deals(
     return {"deals": [d.model_dump(mode="json") for d in deals]}
 
 
+@app.post("/tools/check-visa-with-transit")
+async def check_visa_with_transit(req: VisaCheckRequest):
+    """Check visa + transit countries extracted from deal route.
+
+    Enhanced version: automatically flags Schengen/UK/US transit traps.
+    Pass transit_countries=["GB", "US"] if known from flight route.
+    n8n should extract these from deal.transit_countries field.
+    """
+    checker = VisaChecker(
+        visa_repo=app.state.visa_repo,
+        brave_api_key=settings.brave_search_api_key,
+        passport_type=settings.passport_type,
+    )
+    try:
+        result = await checker.check_deal(
+            country_code=req.country_code,
+            country_name=req.country_name,
+            transit_countries=req.transit_countries,
+        )
+
+        validator = VisaResultValidator()
+        issues = validator.validate(result)
+        if issues:
+            result.warnings.extend([f"VALIDATION: {issue}" for issue in issues])
+
+        if result.is_data_stale:
+            result.warnings.append(
+                "⚠️ STALE DATA: Verify before booking."
+            )
+
+        # Extra: summarize transit blockers clearly
+        transit_blockers = [
+            t.transit_country
+            for t in result.transit_visas
+            if t.visa_required
+        ]
+        if transit_blockers:
+            result.warnings.insert(
+                0,
+                f"🚫 TRANSIT VISA REQUIRED: {', '.join(transit_blockers)}. "
+                "This route is NOT feasible without transit visa(s)."
+            )
+
+        logger.info(
+            "api.visa_transit_checked",
+            country=req.country_code,
+            transit=req.transit_countries,
+            feasible=result.is_feasible,
+            transit_blockers=transit_blockers,
+        )
+        return result
+    except Exception as exc:
+        logger.error("api.visa_transit_error", error=str(exc))
+        raise HTTPException(status_code=502, detail=f"Visa check failed: {exc}")
+    finally:
+        await checker.close()
+
+
 # === Observability endpoints ===
 
 
@@ -322,3 +381,32 @@ async def operational_stats():
             "active_entries": visa_cache_count,
         },
     }
+
+
+@app.post("/ops/warm-visa-cache")
+async def warm_visa_cache():
+    """Proactively re-check Top-10 visa policies for changes.
+
+    Run weekly via n8n cron (Monday 06:00).
+    Sends Telegram alert if any country changed visa status.
+
+    Requires BRAVE_SEARCH_API_KEY to be set (only weekly use, low cost).
+    """
+    if not settings.brave_search_api_key:
+        raise HTTPException(
+            status_code=422,
+            detail="BRAVE_SEARCH_API_KEY not configured. Cache warming requires web search.",
+        )
+
+    warmer = VisaCacheWarmer(
+        visa_repo=app.state.visa_repo,
+        brave_api_key=settings.brave_search_api_key,
+        telegram_bot_token=settings.telegram_bot_token,
+        telegram_chat_id=settings.telegram_chat_id,
+        passport_type=settings.passport_type,
+    )
+    try:
+        result = await warmer.warm_all()
+        return result
+    finally:
+        await warmer.close()

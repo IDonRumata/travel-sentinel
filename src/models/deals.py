@@ -41,6 +41,9 @@ class DealCreate(BaseModel):
     hotel_stars: int | None = Field(default=None, ge=1, le=5)
     meal_plan: MealPlan | None = None
     url: str
+    # Transit countries in route (ISO codes) - for visa transit check
+    # E.g. Minsk → Istanbul → Bangkok = transit_countries=["TR"]
+    transit_countries: list[str] = Field(default_factory=list)
 
     @computed_field
     @property
